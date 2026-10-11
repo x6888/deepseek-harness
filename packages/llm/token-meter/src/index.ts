@@ -67,6 +67,49 @@ interface ReplayState {
   anchor: MeasurementAnchor | undefined
 }
 
+/**
+ * One cached `measure()` result, keyed by the exact inputs it was priced from.
+ *
+ * `(session, revision)` already determines `ReplayState` wholesale — the fold
+ * is append-only and every transition is a pure function of one event — so the
+ * remaining three fields pin down the pricing inputs that are resolved outside
+ * the fold: `header` by value (the envelope is rebuilt by `canonicalHeader` on
+ * every call), `pricing` and `llm` by identity (`llm` decides the file-text
+ * projection; `LlmRuntime` pins one pricing object per route and drops it with
+ * every `llm/adapters-updated` publication, so pricing identity means "same
+ * route, same registration generation"). `fileText` itself stays out of the
+ * key on purpose: `_fileRequestText()` mints a fresh closure per call, so
+ * comparing it would make the memo unreachable.
+ *
+ * **Residual preconditions:** pricing identity cannot see a change that stays
+ * inside one pinned object, so every hit assumes it away. (G-B) A pinned
+ * object captures the connection snapshot it was resolved from — the `models`
+ * catalog with each entry's `inputModalities`, `imagePixelBudget`, and
+ * `imageMaxBytes` — and that snapshot does not refresh while the pin lives:
+ * only republishing the adapter drops it, and how eagerly a plugin does so is
+ * its own choice — `llm-deepseek` replaces only when the route's retry policy
+ * changes, while `llm-pi-ai` replaces whenever any of its registration facts
+ * change — so under `llm-deepseek` a pure catalog or budget update leaves
+ * this memo valid. (G-C) Attachment and
+ * filesystem access resolution is **not** part of this precondition: it is
+ * read from the live `attachments` and `fs` services on every `priceImages`
+ * call, so a miss prices image text live, while a hit skips that call and
+ * reuses the text captured with `result` — which may lag behind an access
+ * change made inside the hit window.
+ */
+interface MeasurementMemo {
+  /** Log revision the replay fold had consumed when `result` was priced. */
+  readonly revision: SessionLogOffsetType
+  /** Effective envelope `result` was priced under. */
+  readonly header: EpochHeader | undefined
+  /** Pinned routed image pricing object `result` was priced under. */
+  readonly pricing: LlmImageRequestPricing | undefined
+  /** Mounted llm service that projected `result`'s file text. */
+  readonly llm: LlmRuntime | undefined
+  /** Deeply frozen measurement, shared verbatim with every hit. */
+  readonly result: TokenMeasurement
+}
+
 /** Sum disjoint provider usage buckets without double-counting reasoning output. */
 function usageTokens(usage: TokenUsage): number {
   return usage.inputTokens
@@ -106,6 +149,8 @@ export class TokenMeter extends Service {
   static inject = ['sessionProjections']
 
   private readonly states = new WeakMap<Session, ReplayState>()
+  /** One latest measurement per session; entries die with their session and with this service. */
+  private readonly measurements = new WeakMap<Session, MeasurementMemo>()
 
   constructor(ctx: Context, config: TokenMeterConfig = {}) {
     super(ctx, 'tokenMeter')
@@ -139,16 +184,53 @@ export class TokenMeter extends Service {
    * pricing; the node set always describes the current session surface. Every
    * call clones those positional nodes, so measurement is O(surface).
    *
+   * Repeated measurements under identical inputs share one deeply frozen
+   * result: the memo is keyed by session identity, `logRevision`, the effective
+   * envelope compared by value, and the routed pricing and mounted llm service
+   * compared by identity — `LlmRuntime` pins one pricing object per route and
+   * drops it with every `llm/adapters-updated` publication, so a route that
+   * changed answers with a different object and misses. Non-surface events bump
+   * the revision and so conservatively invalidate the memo even when the node
+   * set is unchanged. Cached results are released with their session and with
+   * this service.
+   *
+   * The key deliberately covers nothing below route granularity, which
+   * leaves two documented preconditions. (G-B) A pinned pricing object captures
+   * the connection snapshot it was resolved from — the `models` catalog with
+   * each entry's `inputModalities`, `imagePixelBudget`, and `imageMaxBytes` —
+   * so that snapshot does not refresh over the whole window in which the route
+   * keeps hitting: only republishing the adapter renews it, and only that
+   * republishing misses here. Plugins differ in how eagerly they republish:
+   * `llm-deepseek` replaces on a retry-policy change alone, whereas
+   * `llm-pi-ai` replaces whenever any of its registration facts change — the
+   * "only on retry policy" bound therefore describes `llm-deepseek` routes, not
+   * every provider. (G-C) Image access resolution likewise stays outside the
+   * key: `priceImages` reads the current `attachments` and `fs` services on
+   * every call, so a miss prices image text live, while a hit never reaches
+   * `priceSurface` and reuses the text priced into `result`; an access change
+   * inside the hit window is therefore reflected only on the next miss.
+   *
    * @param session - session to replay through its current durable tail.
    * @param requestHeader - optional effective request envelope replacing the latest logged header.
    * @returns a detached deeply immutable pressure and surface measurement.
    */
   measure(session: Session, requestHeader?: EpochHeader): TokenMeasurement {
+    // The fold runs before any lookup: a malformed event has to fail every
+    // call, never just the one that first reached it.
     const state = this._sync(session)
     const header = requestHeader === undefined
       ? state.header
       : canonicalHeader(requestHeader)
+    const llm = this.ctx.get('llm')
     const pricing = this._routeImagePricing(header)
+    const memo = this.measurements.get(session)
+    if (memo !== undefined
+      && memo.revision === state.consumedEvents
+      && memo.llm === llm
+      && memo.pricing === pricing
+      && optionalHeaderEquals(memo.header, header)) {
+      return memo.result
+    }
     const fileText = this._fileRequestText()
     const surface = priceSurface(state.surface, pricing, fileText)
     const anchor = state.anchor
@@ -180,7 +262,7 @@ export class TokenMeter extends Service {
       surfaceDeltaTokens = 0
     }
 
-    return deepFreeze(structuredClone({
+    const result = deepFreeze(structuredClone({
       logRevision: state.consumedEvents,
       baseline,
       surfaceDeltaTokens,
@@ -188,6 +270,14 @@ export class TokenMeter extends Service {
       surfaceTokens: surface.surfaceTokens,
       nodes: surface.nodes,
     }))
+    this.measurements.set(session, {
+      revision: state.consumedEvents,
+      header,
+      pricing,
+      llm,
+      result,
+    })
+    return result
   }
 
   /** Resolve the routed model's image pricing, when the llm service and route declare one. */
