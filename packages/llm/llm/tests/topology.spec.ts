@@ -326,5 +326,21 @@ describe('imageRequestPricing resolution', () => {
     expect(ctx.llm.imageRequestPricing('missing', 'vision')).toBeUndefined()
     dispose()
     expect(ctx.llm.imageRequestPricing('a', 'vision')).toBeUndefined()
+
+    // A pinned route is dropped with every topology publication: re-announcing
+    // the same route resolves the object the adapter serves now, not the one
+    // pinned before the publication.
+    let served = pricing
+    class ServedAdapter extends NoopAdapter {
+      override imageRequestPricing(): typeof pricing {
+        return served
+      }
+    }
+    const handle = ctx.llm.registerAdapter(['a'], new ServedAdapter())
+    ctx.llm.imageRequestPricing('a', 'vision')
+    const replacement = { priceImages: () => [] }
+    served = replacement
+    handle.replace(['a'])
+    expect(ctx.llm.imageRequestPricing('a', 'vision')).toBe(replacement)
   })
 })

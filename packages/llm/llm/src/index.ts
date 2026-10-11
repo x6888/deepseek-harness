@@ -336,6 +336,26 @@ export interface DirectoryRegistrationHandle {
 }
 
 /**
+ * One route's resolved request-image pricing, remembered so repeated
+ * resolutions of the same route share one object identity.
+ *
+ * Adapters mint a fresh pricing object per call, so identity alone cannot say
+ * whether a route still prices the way a caller priced under. The runtime
+ * therefore pins one resolution per exact route and drops it with every
+ * topology publication — the only way the runtime adapter registry ever
+ * changes — so identity means "same route, same registration generation",
+ * which is exactly what a memo key needs.
+ */
+interface ImagePricingMemo {
+  /** Provider route the pricing was resolved for. */
+  readonly provider: string
+  /** Exact model id the pricing was resolved for. */
+  readonly model: string
+  /** Pinned pricing, or `undefined` when the route declares none. */
+  readonly pricing: LlmImageRequestPricing | undefined
+}
+
+/**
  * The abstract `llm` service: an adapter registry plus a streaming model-call
  * API, interceptable via the `llm/stream` waterfall.
  */
@@ -346,6 +366,8 @@ export class LlmRuntime extends TypertRemoteService {
     string,
     (request: LlmModelDiscoveryRequest, signal?: AbortSignal) => Promise<readonly LlmDiscoveredModel[]>
   >()
+  /** Pinned image pricing for one exact route, dropped with every topology publication. */
+  private pricingMemo: ImagePricingMemo | undefined
 
   constructor(ctx: Context) {
     super(ctx, 'llm')
@@ -353,6 +375,9 @@ export class LlmRuntime extends TypertRemoteService {
 
   /** Notify topology observers without letting one broken listener veto the commit. */
   private emitAdaptersUpdated(): void {
+    // Route pricing is pinned per route: a new topology can only mean new
+    // pricing, and this is the one exit every registry write publishes through.
+    this.pricingMemo = undefined
     // Cordis emit uses Array.map: one synchronous throw starves later
     // listeners. Registry notifications are non-vetoing, so contain each
     // callback independently.
@@ -662,12 +687,31 @@ export class LlmRuntime extends TypertRemoteService {
    * `undefined` when the provider is unregistered or declares none. Unknown
    * providers degrade to `undefined` rather than throwing because callers
    * price durable history whose route may no longer be mounted.
+   *
+   * One resolution is pinned per exact route: within one registration
+   * generation, the same `(provider, model)` returns the **same object
+   * reference**, so callers may compare pricing by identity — a `replace`,
+   * a new registration, or a disposal publishes `llm/adapters-updated` and
+   * drops the pin, so a changed route can never answer with a stale object.
+   *
+   * **Precondition:** a pinned object captures the connection snapshot it was
+   * resolved from (the `models` catalog with each entry's `inputModalities`,
+   * `imagePixelBudget`, and `imageMaxBytes`). Those fields are treated as
+   * stable within one registration generation — they are only republished
+   * when the route's retry policy changes — so updating them alone does not
+   * drop the pin. Attachment and filesystem access resolution is **not** part
+   * of this precondition: a pinned object still reads the current
+   * `attachments` and `fs` services on every `priceImages` call.
    * @param provider - provider route named by a request header.
    * @param model - exact model id named by the same header.
    * @returns the owning adapter's image pricing for the route, when declared.
    */
   imageRequestPricing(provider: string, model: string): LlmImageRequestPricing | undefined {
-    return this.adapters.get(provider)?.adapter.imageRequestPricing(provider, model)
+    const memo = this.pricingMemo
+    if (memo !== undefined && memo.provider === provider && memo.model === model) return memo.pricing
+    const pricing = this.adapters.get(provider)?.adapter.imageRequestPricing(provider, model)
+    this.pricingMemo = { provider, model, pricing }
+    return pricing
   }
 
   /**
