@@ -70,6 +70,26 @@ interface CompactionEntryState {
 }
 
 /**
+ * Incremental state over the already-folded log prefix `[0, cursor)`. Every
+ * field is a function of the *last* occurrence of a marker, so folding events
+ * strictly forwards agrees with the reverse scan's first-hit-wins result.
+ */
+interface CompactionEntryFold {
+  /** Next log offset to consume; every event before it has been folded once. */
+  cursor: number
+  openTurn: number | null
+  unmatchedCompactionStart: SessionEvent<'compaction/start'> | undefined
+  latestEndSeedSeq: SessionSeq | undefined
+}
+
+/**
+ * One fold per session. Weak keys release the fold with its session; the cache
+ * is a pure accelerator — a miss degrades to one full fold, never to a
+ * different answer.
+ */
+const compactionEntryFolds = new WeakMap<Session, CompactionEntryFold>()
+
+/**
  * Rejects a summary whose replacement boundaries are no longer the ones it was
  * built from, distinguished from summarizer and shrink failures so a manual
  * caller can report the two causes differently.
@@ -562,39 +582,64 @@ function buildSummarizationInput(
   }
 }
 
-/** Inspect open-turn, unmatched-compaction, and latest seed-boundary state independently. */
+/**
+ * Inspect open-turn, unmatched-compaction, and latest seed-boundary state
+ * independently, folding each logged event at most once per session: the call
+ * only consumes the events appended after the previous read.
+ *
+ * Equivalent to a full reverse scan under these preconditions — all three hold
+ * for the current Session log model:
+ * 1. The log is append-only and `seq` is contiguous from 0 (`eventAt(seq)`
+ *    is `log[seq]`, `session.seq === log.length`), so an already-folded prefix
+ *    can never be invalidated.
+ * 2. There is no `cursor > session.seq` reset guard: the log only grows, and
+ *    the guard would be unreachable. Keep it that way — should that ever
+ *    change, revisit this whole fold instead of patching it here.
+ * 3. All three results are latest-wins (`latestEndSeedSeq` = newest
+ *    `session/end-seed`; `unmatchedCompactionStart` = newest `compaction/start`
+ *    unless closed by a newer `compaction/end`; `openTurn` = newest `turn/start`
+ *    unless closed by a newer `turn/end`). Overwriting while walking forwards
+ *    therefore yields exactly the reverse scan's first-hit value, whose `break`
+ *    was only an early exit that no longer rewrote a settled field.
+ * Consequently, adding a non-latest-wins quantity here (a count, an earliest
+ * occurrence, a running total) silently breaks the fold: such a quantity must
+ * revert this function to a full scan.
+ * @param session - session whose marker state is inspected.
+ * @returns the three independent latest-wins values.
+ */
 function inspectCompactionEntryState(session: Session): CompactionEntryState {
-  let openTurn: number | null = null
-  let openTurnStateKnown = false
-  let unmatchedCompactionStart: SessionEvent<'compaction/start'> | undefined
-  let compactionEntryStateKnown = false
-  let latestEndSeedSeq: SessionSeq | undefined
-  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+  let fold = compactionEntryFolds.get(session)
+  if (fold === undefined) {
+    fold = {
+      cursor: 0,
+      openTurn: null,
+      unmatchedCompactionStart: undefined,
+      latestEndSeedSeq: undefined,
+    }
+    compactionEntryFolds.set(session, fold)
+  }
+  while (fold.cursor < session.seq) {
+    // The fold cursor indexes the persistent log by contiguous session seqs.
     // Existing Session history read; migration deferred.
     // oxlint-disable-next-line typescript/no-non-null-assertion, typescript/no-deprecated
-    const event = session.eventAt(SessionSeq(seq))!
-    if (latestEndSeedSeq === undefined && event.type === 'session/end-seed') {
-      latestEndSeedSeq = event.seq
+    const event = session.eventAt(SessionSeq(fold.cursor))!
+    if (event.type === 'session/end-seed') {
+      fold.latestEndSeedSeq = event.seq
+    } else if (event.type === 'compaction/start') {
+      fold.unmatchedCompactionStart = event
+    } else if (event.type === 'compaction/end') {
+      fold.unmatchedCompactionStart = undefined
+    } else if (event.type === 'turn/start') {
+      fold.openTurn = event.data.turn
+    } else if (event.type === 'turn/end') {
+      fold.openTurn = null
     }
-    if (!compactionEntryStateKnown) {
-      if (event.type === 'compaction/start') {
-        unmatchedCompactionStart = event
-        compactionEntryStateKnown = true
-      } else if (event.type === 'compaction/end') {
-        compactionEntryStateKnown = true
-      }
-    }
-    if (!openTurnStateKnown) {
-      if (event.type === 'turn/start') {
-        openTurn = event.data.turn
-        openTurnStateKnown = true
-      } else if (event.type === 'turn/end') {
-        openTurnStateKnown = true
-      }
-    }
-    if (openTurnStateKnown
-      && compactionEntryStateKnown
-      && latestEndSeedSeq !== undefined) break
+    fold.cursor += 1
   }
-  return { openTurn, unmatchedCompactionStart, latestEndSeedSeq }
+  // Copied out, never handed over: callers cannot mutate the incremental fold.
+  return {
+    openTurn: fold.openTurn,
+    unmatchedCompactionStart: fold.unmatchedCompactionStart,
+    latestEndSeedSeq: fold.latestEndSeedSeq,
+  }
 }
